@@ -1,11 +1,14 @@
 import os
 import sys
+import time
 import argparse
 
 import cv2
 import numpy as np
 
-from hands import HandTracker, GestureKNN, classify_hands, draw_hands, put_text
+from hands import HandTracker, GestureKNN, classify_hands, put_text
+from filters import FilterManager, MODES
+from switch import SignSwitch
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -26,6 +29,7 @@ EMOTIONS = ["neutral", "happy", "surprise", "sad", "angry", "disgust", "fear", "
 MEAN     = (78.4263377603, 87.7689143744, 114.895847746)
 
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
+CONTROL_SIGNS = ("A", "B")      # reserved: A = features on, B = features off
 
 
 def need(path):
@@ -42,7 +46,7 @@ age_net     = cv2.dnn.readNet(need(AGE_MODEL), need(AGE_PROTO))
 gender_net  = cv2.dnn.readNet(need(GENDER_MODEL), need(GENDER_PROTO))
 emotion_net = cv2.dnn.readNetFromONNX(need(EMOTION))
 
-hand_tracker = HandTracker(max_hands=2)
+hand_tracker = None          # created in main() (needs to know image vs video)
 knns = {"custom": GestureKNN("custom"), "signs": GestureKNN("signs")}
 
 
@@ -99,9 +103,29 @@ def analyze(frame):
 
 
 def analyze_hands(frame):
+    """Returns (hands, control). The control signs A / B are never shown as letters."""
     hands = hand_tracker.detect(frame)
     classify_hands(hands, knns)
-    return hands
+    control = None
+    for h in hands:
+        if h.sign and h.sign[0] in CONTROL_SIGNS:
+            control = h.sign[0]
+            h.sign = None
+    return hands, control
+
+
+def draw_status(frame, sw):
+    """Top-right: features ON/OFF and the hold progress of an A / B sign."""
+    W = frame.shape[1]
+
+    def right(text, y, color):
+        (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        put_text(frame, text, W - tw - 10, y, color)
+
+    right(f"Features: {'ON' if sw.on else 'OFF'}  (sign A = on, B = off)", 20,
+          (0, 255, 0) if sw.on else (0, 0, 255))
+    if sw.candidate and sw.progress > 0:
+        right(f"Holding {sw.candidate}... {sw.progress:.0%}", 42, (0, 255, 255))
 
 
 def draw(frame, results):
@@ -172,15 +196,28 @@ def main():
                     help="record training samples for this gesture / letter")
     ap.add_argument("--set", choices=["custom", "signs"], default="custom",
                     help="dataset to record into (custom gestures or sign language)")
+    ap.add_argument("--start", choices=["on", "off"], default="on",
+                    help="start with the A/B-controlled features on or off")
+    ap.add_argument("--filter", choices=MODES, default="portal",
+                    help="starting hand filter (press F to cycle while running)")
+    ap.add_argument("--no-smooth", action="store_true",
+                    help="turn off landmark smoothing")
     args = ap.parse_args()
 
+    global hand_tracker
+    is_image = args.source.lower().endswith(IMAGE_EXT)
+    hand_tracker = HandTracker(max_hands=2, video=not is_image,
+                               smooth=not args.no_smooth)
+    filters = FilterManager(args.filter)
+
     # Single image
-    if args.source.lower().endswith(IMAGE_EXT):
+    if is_image:
         img = cv2.imread(args.source)
         if img is None:
             sys.exit(f"Cannot read image: {args.source}")
+        hands, _ = analyze_hands(img)
+        img = filters.apply(img, hands)
         draw(img, analyze(img))
-        draw_hands(img, analyze_hands(img))
         cv2.imshow("Person Analyzer", img)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
@@ -197,23 +234,44 @@ def main():
     rec_knn = knns[args.set] if args.record else None
     recording = False
 
-    n, results = 0, []
+    # A / B sign switch (disabled while recording samples, since you would hold A / B)
+    use_switch = rec_knn is None
+    switch = SignSwitch("A", "B", start_on=(args.start == "on"))
+    missing = [c for c in CONTROL_SIGNS if knns["signs"].count(c) == 0]
+    if use_switch and missing:
+        print(f"Note: no samples for sign(s) {missing} in data/signs.csv - the A/B "
+              f"switch needs them. Import or record them first.")
+
+    n, results, force = 0, [], True
     try:
         while True:
             ok, frame = cap.read()
             if not ok or frame is None:
                 break
-            if n % args.every == 0:
-                results = analyze(frame)           # face models (slow) every N frames
-            hands = analyze_hands(frame)           # hands every frame (fast)
+            hands, ctrl = analyze_hands(frame)     # hands every frame (fast)
+            if use_switch and switch.update(ctrl, time.perf_counter()):
+                print(f"Features {'ON' if switch.on else 'OFF'} (sign {ctrl})")
+                force = switch.on
+            on = switch.on if use_switch else True
+
+            if on:
+                if force or n % args.every == 0:   # face models (slow) every N frames
+                    results, force = analyze(frame), False
+            else:
+                results = []                       # face / gender / age / emotion off
+                for h in hands:
+                    h.sign = None                  # sign language off
 
             # Record training samples from the first detected hand
             if rec_knn and recording and hands and n % 2 == 0:
                 rec_knn.add(args.record, hands[0].feat)
             n += 1
 
-            draw(frame, results)
-            draw_hands(frame, hands)
+            frame = filters.apply(frame, hands, enabled=on,
+                                  allow_style=ctrl is None)
+            draw(frame, results)                   # face boxes on top
+            if use_switch:
+                draw_status(frame, switch)
 
             if rec_knn:
                 state = "REC" if recording else "paused"
@@ -225,10 +283,17 @@ def main():
 
             cv2.imshow("Person Analyzer", frame)
             key = cv2.waitKey(1) & 0xFF
-            if key in (ord("q"), 27):
+            k = chr(key).lower() if key < 128 else ""
+            if k == "q" or key == 27:
                 break
             if key == 32:
                 recording = not recording
+            elif k == "f":
+                filters.next()
+            elif k == "c":
+                filters.clear()
+            elif k == "n":
+                filters.next_portal()
     finally:
         if rec_knn:
             rec_knn.save()

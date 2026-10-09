@@ -4,6 +4,7 @@ custom gestures and static sign language (all landmark-based).
 """
 import os
 import csv
+import time
 import urllib.request
 
 import cv2
@@ -24,6 +25,39 @@ CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4),
                (5, 9), (9, 10), (10, 11), (11, 12),
                (9, 13), (13, 14), (14, 15), (15, 16),
                (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)]
+
+# Smoothing strength (One Euro filter). Lower min_cutoff = smoother when still,
+# higher beta = less lag when the hand moves fast.
+SMOOTH_MIN_CUTOFF = 1.2
+SMOOTH_BETA = 0.02
+
+
+class OneEuro:
+    """One Euro filter: strong smoothing when still, low lag when moving."""
+
+    def __init__(self, min_cutoff=SMOOTH_MIN_CUTOFF, beta=SMOOTH_BETA, d_cutoff=1.0):
+        self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
+        self.x = self.dx = self.t = None
+
+    @staticmethod
+    def _alpha(dt, cutoff):
+        tau = 1.0 / (2 * np.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        if self.x is None:
+            self.x, self.dx, self.t = x.copy(), np.zeros_like(x), t
+            return x
+        dt = max(t - self.t, 1e-3)
+        dx = (x - self.x) / dt
+        a_d = self._alpha(dt, self.d_cutoff)
+        self.dx = a_d * dx + (1 - a_d) * self.dx
+        cutoff = self.min_cutoff + self.beta * np.abs(self.dx)
+        a = self._alpha(dt, cutoff)
+        self.x = a * x + (1 - a) * self.x
+        self.t = t
+        return self.x.copy()
+
 
 # finger -> (pip joint, tip)
 FINGER_JOINTS = {"index": (6, 8), "middle": (10, 12), "ring": (14, 16), "pinky": (18, 20)}
@@ -142,9 +176,10 @@ class GestureKNN:
 # Hand object + tracker
 # ---------------------------------------------------------------------------
 class Hand:
-    def __init__(self, pts, label):
+    def __init__(self, pts, label, id=0):
         self.pts = pts                          # (21, 3) pixel coords
         self.label = label
+        self.id = id                            # stable id while the hand stays visible
         self.fingers = finger_states(pts)
         self.count = sum(self.fingers.values())
         self.state = open_closed(self.fingers)
@@ -173,25 +208,87 @@ def ensure_model():
 
 
 class HandTracker:
-    def __init__(self, max_hands=2):
+    """
+    video=False -> IMAGE mode (single photos, dataset import)
+    video=True  -> VIDEO mode: MediaPipe tracks between frames (faster, steadier)
+    smooth=True -> additionally smooth landmarks with a One Euro filter (video only)
+    """
+
+    def __init__(self, max_hands=2, video=False, smooth=False):
         ensure_model()
+        self.video = video
+        self.smooth = smooth and video
+        mode = vision.RunningMode.VIDEO if video else vision.RunningMode.IMAGE
         opts = vision.HandLandmarkerOptions(
             base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+            running_mode=mode,
             num_hands=max_hands,
             min_hand_detection_confidence=0.5,
             min_hand_presence_confidence=0.5,
             min_tracking_confidence=0.5,
         )
         self.lm = vision.HandLandmarker.create_from_options(opts)
+        self.tracks = {}        # id -> {"wrist", "filter", "miss"}
+        self.next_id = 0
+        self.last_ts = -1
+
+    def _match(self, wrists, width):
+        """Give each detected hand the id of the nearest hand from the last frame."""
+        limit = 0.3 * width
+        ids, used = [], set()
+        for wr in wrists:
+            best, bd = None, limit
+            for tid, tr in self.tracks.items():
+                if tid in used:
+                    continue
+                d = float(np.linalg.norm(wr - tr["wrist"]))
+                if d < bd:
+                    best, bd = tid, d
+            if best is None:
+                best = self.next_id
+                self.next_id += 1
+                self.tracks[best] = {"wrist": wr.copy(), "filter": OneEuro(), "miss": 0}
+            used.add(best)
+            self.tracks[best]["miss"] = 0
+            ids.append(best)
+        for tid in list(self.tracks):
+            if tid not in used:
+                self.tracks[tid]["miss"] += 1
+                if self.tracks[tid]["miss"] > 8:     # forget hands gone for ~8 frames
+                    del self.tracks[tid]
+        return ids
 
     def detect(self, frame):
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        res = self.lm.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb))
-        hands = []
+        img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+        if self.video:
+            ts = int(time.perf_counter() * 1000)
+            if ts <= self.last_ts:                   # timestamps must increase
+                ts = self.last_ts + 1
+            self.last_ts = ts
+            res = self.lm.detect_for_video(img, ts)
+        else:
+            res = self.lm.detect(img)
+
+        raw = []
         for lms, hd in zip(res.hand_landmarks, res.handedness):
             pts = np.array([[l.x * w, l.y * h, l.z * w] for l in lms], dtype=np.float32)
-            hands.append(Hand(pts, hd[0].category_name))
+            raw.append((pts, hd[0].category_name))
+
+        if not self.video:
+            return [Hand(p, lab, i) for i, (p, lab) in enumerate(raw)]
+
+        ids = self._match([p[0, :2] for p, _ in raw], w)
+        now = time.perf_counter()
+        hands = []
+        for (pts, label), tid in zip(raw, ids):
+            tr = self.tracks[tid]
+            if self.smooth:
+                pts = tr["filter"](pts, now)
+            tr["wrist"] = pts[0, :2].copy()
+            hands.append(Hand(pts, label, tid))
         return hands
 
 
@@ -209,14 +306,19 @@ def put_text(img, t, x, y, color=(255, 255, 255)):
     cv2.putText(img, t, (x, y), FONT, 0.55, color, 1, cv2.LINE_AA)
 
 
-def draw_hands(frame, hands):
+def draw_skeleton(frame, hands):
     for h in hands:
         pts = [(int(x), int(y)) for x, y, _ in h.pts]
         for a, b in CONNECTIONS:
             cv2.line(frame, pts[a], pts[b], (255, 200, 0), 2, cv2.LINE_AA)
         for pt in pts:
             cv2.circle(frame, pt, 3, (0, 0, 255), -1)
+    return frame
 
+
+def draw_labels(frame, hands):
+    for h in hands:
+        pts = [(int(x), int(y)) for x, y, _ in h.pts]
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         x0, y0, x1, y1 = min(xs) - 10, min(ys) - 10, max(xs) + 10, max(ys) + 10
         cv2.rectangle(frame, (x0, y0), (x1, y1), (255, 200, 0), 1)
@@ -228,3 +330,7 @@ def draw_hands(frame, hands):
                 ty = y1 + 20 + 18 * i
             put_text(frame, t, x0, ty, (0, 255, 255))
     return frame
+
+
+def draw_hands(frame, hands):
+    return draw_labels(draw_skeleton(frame, hands), hands)
